@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-wecom-bridge/internal/protocol"
@@ -66,10 +67,22 @@ type Bridge struct {
 
 	// chat.updated dedup：chatId → lastRunId
 	pushDedup map[string]string
+
+	// pendingRefs：chatId → 最近已 /api/upload 还没被下一次 /api/query 消费的 reference 列表。
+	// 用途：用户在企微里先发文件再发问句，这两帧独立，platform 的 Runtime Context 不会自动
+	// 把刚上传的文件列进 references；bridge 这边缓存一下，在下次 forwardText 带进去，
+	// 让 agent 在 system prompt 的 Session.references 里直接看到文件名。
+	pendingRefs   map[string][]map[string]any
+	pendingRefsMu sync.Mutex
 }
 
 func NewBridge(cfg BridgeConfig) *Bridge {
-	return &Bridge{cfg: cfg, formatter: protocol.NewFormatter(), pushDedup: map[string]string{}}
+	return &Bridge{
+		cfg:         cfg,
+		formatter:   protocol.NewFormatter(),
+		pushDedup:   map[string]string{},
+		pendingRefs: map[string][]map[string]any{},
+	}
 }
 
 // SetWecom 在 bridge 创建之后、wecom.Client 初始化完成时注入。
@@ -79,6 +92,29 @@ func (b *Bridge) SetWecom(w WecomSender) { b.cfg.Wecom = w }
 
 // SetStream 注入 StreamSender；main 在 wecom.Client 构造完成后再构造 StreamSender。
 func (b *Bridge) SetStream(s *StreamSender) { b.cfg.Stream = s }
+
+// addPendingRef 在 handleMedia 把文件推给 platform 之后调用，记下一个待带入下次
+// forwardText 的 reference。
+func (b *Bridge) addPendingRef(chatID string, ref map[string]any) {
+	if chatID == "" || ref == nil {
+		return
+	}
+	b.pendingRefsMu.Lock()
+	b.pendingRefs[chatID] = append(b.pendingRefs[chatID], ref)
+	count := len(b.pendingRefs[chatID])
+	b.pendingRefsMu.Unlock()
+	diag.Info("bridge.wecom.refs.pending", "chatId", chatID, "name", ref["name"], "pending", count)
+}
+
+// takePendingRefs 在 forwardText 组装 /api/query payload 时调用，返回并清空当前 chatId 的
+// pending references。消费即清空，避免下一条问句里重复带同一份文件。
+func (b *Bridge) takePendingRefs(chatID string) []map[string]any {
+	b.pendingRefsMu.Lock()
+	defer b.pendingRefsMu.Unlock()
+	refs := b.pendingRefs[chatID]
+	delete(b.pendingRefs, chatID)
+	return refs
+}
 
 // HandleWecomMessage 处理 wecom 推来的帧（aibot_msg_callback）。
 func (b *Bridge) HandleWecomMessage(in Inbound) {
@@ -140,7 +176,8 @@ func (b *Bridge) forwardText(in Inbound, content string) {
 	receiveID := scope.SourceID
 	receiveIDType := "chatid"
 
-	chatID := b.formatter.Format(scope.ChatType, scope.SourceID, time.Now())
+	chatID := b.formatter.ResolveOrCreate(b.cfg.AppKey, scope.ChatType, scope.SourceID, time.Now())
+	diag.Info("bridge.wecom.forward", "chatId", chatID, "msgtype", in.Body.MsgType, "sourceReqId", in.Headers.ReqID)
 	b.cfg.Registry.Register(chatID, Target{
 		AppKey:        b.cfg.AppKey,
 		ReceiveID:     receiveID,
@@ -153,6 +190,13 @@ func (b *Bridge) forwardText(in Inbound, content string) {
 	if b.cfg.Stream != nil {
 		b.cfg.Stream.Open(reqID, chatID, in.Headers.ReqID)
 	}
+	refs := b.takePendingRefs(chatID)
+	if len(refs) == 0 {
+		// json.Marshal 不能把 nil slice 写成 []，显式给空数组，保持对端类型。
+		refs = []map[string]any{}
+	} else {
+		diag.Debug("bridge.wecom.forward.refs", "chatId", chatID, "count", len(refs))
+	}
 	payload := map[string]any{
 		"requestId":  reqID,
 		"message":    content,
@@ -160,7 +204,7 @@ func (b *Bridge) forwardText(in Inbound, content string) {
 		"chatId":     chatID,
 		"runId":      uuid.NewString(),
 		"userId":     userID,
-		"references": []any{},
+		"references": refs,
 		"params": map[string]any{
 			"channel":           b.cfg.Channel,
 			"wecomAppKey":       b.cfg.AppKey,
@@ -236,7 +280,8 @@ func (b *Bridge) handleMedia(in Inbound) {
 	receiveID := scope.SourceID
 	receiveIDType := "chatid"
 
-	chatID := b.formatter.Format(scope.ChatType, scope.SourceID, time.Now())
+	chatID := b.formatter.ResolveOrCreate(b.cfg.AppKey, scope.ChatType, scope.SourceID, time.Now())
+	diag.Info("bridge.wecom.media", "chatId", chatID, "msgtype", in.Body.MsgType, "sourceReqId", in.Headers.ReqID)
 	b.cfg.Registry.Register(chatID, Target{
 		AppKey:        b.cfg.AppKey,
 		ReceiveID:     receiveID,
@@ -276,7 +321,19 @@ func (b *Bridge) handleMedia(in Inbound) {
 	req := protocol.Request{Type: "/api/upload", ID: reqID, Payload: raw}
 	if err := b.cfg.Platform.SendFrame(req); err != nil {
 		diag.Warn("bridge.wecom.media.platform_send_fail", "err", err)
+		return
 	}
+	// 把这次 upload 记进 pendingRefs，下次 forwardText 会把它塞进 /api/query 的
+	// references 字段，让 agent 的 Runtime Context.Session.references 能看到文件名。
+	b.addPendingRef(chatID, map[string]any{
+		"id":        fileID,
+		"type":      uploadType, // "image" / "file"
+		"name":      meta.Name,
+		"mimeType":  meta.MimeType,
+		"sizeBytes": meta.SizeBytes,
+		"sha256":    meta.SHA256,
+		"url":       urlPath,
+	})
 }
 
 // SendMediaToWecom 由 httpapi /api/push 回调：把 platform 推过来的文件交给企微。

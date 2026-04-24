@@ -37,19 +37,52 @@ func Parse(s string) (Parsed, error) {
 	return Parsed{ChatType: m[1], SourceID: m[2], Seq: m[3]}, nil
 }
 
-// Formatter 负责生成单调递增的 seq。并发安全。
+// Formatter 负责生成单调递增的 seq、并按 (appKey, chatType, sourceId) 缓存 chatId。
+// 对齐 Java WecomSessionChatIdService.resolveOrCreate —— 同一用户在同一 bot 里
+// 跨消息复用同一 chatId，agent 沙箱挂载的 /workspace 才能在多轮对话里看到之前
+// 上传的文件。缓存仅在内存，重启清空（与 Java 的 ConcurrentMap 同语义）。
 type Formatter struct {
 	mu      sync.Mutex
 	lastSec int64
 	inSec   int64 // 本秒的 counter 0..999；超过 999 则进位到下一秒
+
+	// sourceKey("<appKey>|<chatType>|<sourceId>") → chatId
+	cache map[string]string
 }
 
-func NewFormatter() *Formatter { return &Formatter{} }
+func NewFormatter() *Formatter { return &Formatter{cache: map[string]string{}} }
 
-// Format 生成 chatId；传入 now 以便测试可控时间。
+// Format 始终生成新 chatId（保留给特殊场景；日常入站消息走 ResolveOrCreate）。
+// 传入 now 以便测试可控时间。
 func (f *Formatter) Format(chatType, sourceID string, now time.Time) string {
-	sec := now.Unix()
 	f.mu.Lock()
+	seq := f.nextSeqLocked(now)
+	f.mu.Unlock()
+	return "wecom#" + chatType + "#" + sourceID + "#" + strings.ToLower(strconv.FormatInt(seq, 36))
+}
+
+// ResolveOrCreate 对齐 Java WecomSessionChatIdService.resolveOrCreate：
+// 按 (appKey, chatType, sourceId) 缓存 chatId；首次访问才生成新 seq，后续复用。
+// appKey 允许为空（单租户 bridge 场景），空串归一化为 "default"。
+func (f *Formatter) ResolveOrCreate(appKey, chatType, sourceID string, now time.Time) string {
+	if appKey == "" {
+		appKey = "default"
+	}
+	key := appKey + "|" + chatType + "|" + sourceID
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if existing, ok := f.cache[key]; ok {
+		return existing
+	}
+	seq := f.nextSeqLocked(now)
+	id := "wecom#" + chatType + "#" + sourceID + "#" + strings.ToLower(strconv.FormatInt(seq, 36))
+	f.cache[key] = id
+	return id
+}
+
+// nextSeqLocked 必须在持有 f.mu 状态下调用。
+func (f *Formatter) nextSeqLocked(now time.Time) int64 {
+	sec := now.Unix()
 	if sec <= f.lastSec {
 		f.inSec++
 		if f.inSec > 999 {
@@ -61,7 +94,5 @@ func (f *Formatter) Format(chatType, sourceID string, now time.Time) string {
 		f.lastSec = sec
 		f.inSec = 0
 	}
-	seq := sec*1000 + f.inSec
-	f.mu.Unlock()
-	return "wecom#" + chatType + "#" + sourceID + "#" + strings.ToLower(strconv.FormatInt(seq, 36))
+	return sec*1000 + f.inSec
 }

@@ -44,6 +44,37 @@ func TestParseInvalid(t *testing.T) {
 	}
 }
 
+// ResolveOrCreate 对同一 (appKey, chatType, sourceId) 必须返回同一 chatId，
+// 跨消息复用——对齐 Java WecomSessionChatIdService.resolveOrCreate。
+func TestResolveOrCreateReusesSameChatIDForSameSource(t *testing.T) {
+	f := NewFormatter()
+	now := time.Unix(1700000000, 0)
+
+	a := f.ResolveOrCreate("default", "single", "user-1", now)
+	b := f.ResolveOrCreate("default", "single", "user-1", now.Add(time.Hour))
+	if a != b {
+		t.Fatalf("same (app,type,source) must reuse chatId: %s vs %s", a, b)
+	}
+
+	// 不同 sourceId 应该产生不同 chatId
+	c := f.ResolveOrCreate("default", "single", "user-2", now)
+	if c == a {
+		t.Fatalf("different sourceId must produce different chatId: %s", c)
+	}
+
+	// 不同 chatType 应该独立（同一用户私聊和群聊不是一个会话）
+	d := f.ResolveOrCreate("default", "group", "user-1", now)
+	if d == a {
+		t.Fatalf("different chatType must produce different chatId: %s", d)
+	}
+
+	// 空 appKey 归一化为 default，应与显式 default 同组
+	e := f.ResolveOrCreate("", "single", "user-1", now)
+	if e != a {
+		t.Fatalf("empty appKey should normalize to default: %s vs %s", e, a)
+	}
+}
+
 func TestFormatMonotonic(t *testing.T) {
 	f := NewFormatter()
 	a := f.Format("single", "abc", time.Unix(1700000000, 0))

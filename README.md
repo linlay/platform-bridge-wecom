@@ -78,10 +78,30 @@ internal/
 ## 运行
 
 ```bash
-make build       # → bin/agent-wecom-bridge
+make build       # → bin/platform-bridge-wecom
 make run         # 读 .env 启动
 make test        # go test ./...
 ```
+
+## 打包分发（desktop 插件用）
+
+六平台交叉编译，产物在 `dist/<version>/`：
+
+```bash
+make release                       # 全量 (win/mac/linux × amd64/arm64)
+make release-current               # 只编当前平台，快速本地冒烟
+bash scripts/build-release.sh      # 等价于 make release
+bash scripts/build-release.sh linux/amd64   # 指定单平台
+```
+
+Windows 本地跑：
+
+```powershell
+scripts\build-release.ps1
+scripts\build-release.ps1 windows/amd64
+```
+
+每个平台打成独立压缩包（windows → `.zip`，其他 → `.tar.gz`），含二进制 + `README.md` + `SPEC.md` + `VERSION` + `.env.example`，`SHA256SUMS.txt` 一并输出。版本号从 `VERSION` 读，也可以 `VERSION=1.2.3 make release` 覆盖；commit hash 和 build time 通过 `-ldflags` 打进二进制，`bridge --version` 可查。
 
 启动后 stdout 会打印：
 

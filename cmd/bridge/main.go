@@ -18,18 +18,31 @@ import (
 	"agent-wecom-bridge/internal/wecom"
 )
 
+// 由 ldflags 注入（见 scripts/build-release.sh）。dev 构建为占位值。
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 // platformSenderAdapter 把 server.Broadcast 适配成 wecom.PlatformSender 接口。
 type platformSenderAdapter struct{ ws *server.WSServer }
 
 func (p *platformSenderAdapter) SendFrame(v any) error { return p.ws.Broadcast(v) }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version" || os.Args[1] == "version") {
+		log.Printf("platform-bridge-wecom %s (commit %s, built %s)", version, commit, buildTime)
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
 	diag.Configure(cfg.LogLevel)
 	diag.Info("bridge.config.loaded",
+		"version", version,
+		"commit", commit,
 		"http_addr", cfg.HTTPAddr,
 		"state_dir", cfg.StateDir,
 		"agent_key", cfg.AgentKey,

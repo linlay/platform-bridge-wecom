@@ -1,0 +1,7 @@
+.env
+bin/
+dist/
+runtime/
+*.log
+.DS_Store
+.idea/

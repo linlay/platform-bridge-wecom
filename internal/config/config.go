@@ -5,10 +5,8 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -94,63 +92,59 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// loadBots 解析 bots.json，失败退回 legacy 单 bot env。
-// 路径优先级：BRIDGE_BOTS_FILE > $StateDir/bots.json。
-// WecomEnabled=false 时返回 nil（Phase 2 或不跑 wecom 的单元测试场景）。
+// loadBots 按顺序扫描 WECOM_BOT_<i>_ID / _SECRET / _APPKEY（i 从 0 起），
+// 遇到首个缺失 _ID 的 index 就停；全部为空时退回 legacy 单 bot（WECOM_BOT_ID+WECOM_SECRET）。
+// 这个结构对 desktop 可视化 UI 友好：每行一个 bot，增删只操作 3 个 env key。
+// WecomEnabled=false 返回 nil（Phase 2 或不跑 wecom 的单元测试场景）。
 func loadBots(cfg Config) ([]BotConfig, error) {
 	if !cfg.WecomEnabled {
 		return nil, nil
 	}
 
-	path := strings.TrimSpace(os.Getenv("BRIDGE_BOTS_FILE"))
-	if path == "" {
-		path = filepath.Join(cfg.StateDir, "bots.json")
-	}
-
-	if data, err := os.ReadFile(path); err == nil {
-		var bots []BotConfig
-		if err := json.Unmarshal(data, &bots); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
+	var bots []BotConfig
+	for i := 0; ; i++ {
+		id := strings.TrimSpace(os.Getenv(fmt.Sprintf("WECOM_BOT_%d_ID", i)))
+		if id == "" {
+			break
 		}
-		return validateBots(bots, path)
+		secret := strings.TrimSpace(os.Getenv(fmt.Sprintf("WECOM_BOT_%d_SECRET", i)))
+		if secret == "" {
+			return nil, fmt.Errorf("WECOM_BOT_%d_ID is set but WECOM_BOT_%d_SECRET is empty", i, i)
+		}
+		appKey := strings.TrimSpace(os.Getenv(fmt.Sprintf("WECOM_BOT_%d_APPKEY", i)))
+		if appKey == "" {
+			appKey = id // fallback：未指定时用 bot id 当 appKey，保证唯一
+		}
+		bots = append(bots, BotConfig{ID: id, Secret: secret, AppKey: appKey})
 	}
 
-	// legacy 单 bot env：WECOM_BOT_ID + WECOM_SECRET 合成一条
-	if cfg.WecomBotID == "" || cfg.WecomSecret == "" {
-		return nil, fmt.Errorf("WECOM_ENABLED=true but no bot credentials: set bots.json or WECOM_BOT_ID+WECOM_SECRET")
+	if len(bots) == 0 {
+		// legacy 单 bot：WECOM_BOT_ID + WECOM_SECRET，同时保留给无 desktop 的裸部署
+		if cfg.WecomBotID == "" || cfg.WecomSecret == "" {
+			return nil, fmt.Errorf("WECOM_ENABLED=true but no bot credentials: set WECOM_BOT_<i>_ID/_SECRET or legacy WECOM_BOT_ID+WECOM_SECRET")
+		}
+		appKey := cfg.WecomAppKey
+		if appKey == "" {
+			appKey = "default"
+		}
+		bots = []BotConfig{{ID: cfg.WecomBotID, Secret: cfg.WecomSecret, AppKey: appKey}}
 	}
-	appKey := cfg.WecomAppKey
-	if appKey == "" {
-		appKey = "default"
-	}
-	return []BotConfig{{ID: cfg.WecomBotID, Secret: cfg.WecomSecret, AppKey: appKey}}, nil
+
+	return validateBots(bots)
 }
 
-func validateBots(bots []BotConfig, path string) ([]BotConfig, error) {
-	if len(bots) == 0 {
-		return nil, fmt.Errorf("%s is empty: need at least one bot", path)
-	}
+func validateBots(bots []BotConfig) ([]BotConfig, error) {
 	seenKeys := map[string]int{}
 	seenIDs := map[string]int{}
 	for i, b := range bots {
-		b.ID = strings.TrimSpace(b.ID)
-		b.Secret = strings.TrimSpace(b.Secret)
-		b.AppKey = strings.TrimSpace(b.AppKey)
-		if b.ID == "" || b.Secret == "" {
-			return nil, fmt.Errorf("%s[%d]: id and secret required", path, i)
-		}
-		if b.AppKey == "" {
-			b.AppKey = b.ID // 未指定时用 bot id 兜底，保证唯一
-		}
 		if prev, dup := seenKeys[b.AppKey]; dup {
-			return nil, fmt.Errorf("%s: duplicate appKey %q at entries [%d] and [%d]", path, b.AppKey, prev, i)
+			return nil, fmt.Errorf("duplicate appKey %q at bots [%d] and [%d]", b.AppKey, prev, i)
 		}
 		seenKeys[b.AppKey] = i
 		if prev, dup := seenIDs[b.ID]; dup {
-			return nil, fmt.Errorf("%s: duplicate bot id %q at entries [%d] and [%d]", path, b.ID, prev, i)
+			return nil, fmt.Errorf("duplicate bot id %q at bots [%d] and [%d]", b.ID, prev, i)
 		}
 		seenIDs[b.ID] = i
-		bots[i] = b
 	}
 	return bots, nil
 }

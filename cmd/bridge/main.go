@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -137,6 +140,9 @@ func main() {
 	mux.HandleFunc("/ws/agent", ws.HandleAgentWS)
 	mux.Handle("/api/push", api.Router())
 	mux.Handle("/api/download/", api.Router())
+	// /gateway/info: desktop 拉到本插件的 platform 注册信息（id/channel/url/token/baseUrl），
+	// 再 POST 到 platform 的 /api/admin/gateways。只接受 loopback，避免外网拿到 JWT。
+	mux.HandleFunc("/gateway/info", loopbackOnly(handleGatewayInfo(cfg, tk)))
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
 
@@ -162,4 +168,69 @@ func main() {
 		log.Printf("http shutdown: %v", err)
 	}
 	diag.Info("bridge.shutdown.complete")
+}
+
+// handleGatewayInfo 返回 desktop 注册这个 bridge 到 platform 所需的字段。
+// 形状与 platform /api/admin/gateways POST body 一致，desktop 直接透传。
+//
+//   - id:      gateway 在 platform 里的唯一键，默认 "{channel}-{botId}"，否则 "bridge-{channel}"
+//   - channel: 路由前缀（"wecom" / "feishu" / ...），从 BRIDGE_CHANNEL 的 "wecom:xxx" 取冒号前
+//   - url:     platform 反向连接用的 ws URL（host 从 Host header 推导，scheme 默认 ws）
+//   - token:   bridge 签发的 JWT，platform 握手用 Bearer
+//   - baseUrl: http(s):// 版本，platform 回取 artifact / 下载用户文件时用
+func handleGatewayInfo(cfg config.Config, token string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		channel := cfg.Channel
+		if idx := strings.Index(channel, ":"); idx > 0 {
+			channel = channel[:idx]
+		}
+
+		id := strings.TrimSpace(cfg.WecomBotID)
+		if id != "" {
+			id = channel + "-" + id
+		} else {
+			id = "bridge-" + channel
+		}
+
+		host := r.Host
+		if cfg.PublicBaseURL != "" {
+			host = strings.TrimPrefix(strings.TrimPrefix(cfg.PublicBaseURL, "http://"), "https://")
+			host = strings.TrimSuffix(host, "/")
+		}
+		wsURL := "ws://" + host + "/ws/agent?agentKey=" + cfg.AgentKey + "&channel=" + cfg.Channel
+		baseURL := "http://" + host
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      id,
+			"channel": channel,
+			"url":     wsURL,
+			"token":   token,
+			"baseUrl": baseURL,
+		})
+	}
+}
+
+// loopbackOnly 限制 handler 只接受 127.0.0.1 / ::1 请求。
+// desktop 和 bridge 一定同机，外网来的请求必然是误触（或攻击）。
+func loopbackOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := r.RemoteAddr
+		if idx := strings.LastIndex(host, ":"); idx > 0 {
+			host = host[:idx]
+		}
+		host = strings.Trim(host, "[]")
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			http.Error(w, "loopback only", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
 }

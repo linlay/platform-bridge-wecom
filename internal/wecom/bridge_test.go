@@ -68,14 +68,13 @@ func newBridge(t *testing.T) (*Bridge, *fakeWecom, *fakePlatform, *Registry) {
 	fw := &fakeWecom{}
 	fp := &fakePlatform{}
 	b := NewBridge(BridgeConfig{
-		AppKey:   "default",
 		Channel:  "wecom:personal",
 		AgentKey: "personal",
-		Wecom:    fw,
 		Platform: fp,
 		Registry: reg,
 		Dedup:    NewDedup(time.Minute),
 	})
+	b.SetWecom(fw)
 	return b, fw, fp, reg
 }
 

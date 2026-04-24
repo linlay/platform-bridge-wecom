@@ -5,8 +5,10 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,10 +33,23 @@ type Config struct {
 	// 企微 Bot 连接参数（Phase 3）
 	WecomEnabled      bool
 	WecomWSURL        string
-	WecomBotID        string
+	WecomBotID        string // legacy 单 bot 字段；多 bot 下退化为 Bots[0] 的便利副本
 	WecomSecret       string
 	WecomAppKey       string
 	WecomHeartbeatSec int
+
+	// Bots 支持一个 bridge 进程连接多个企微 bot（N 个 ws 订阅并存）。
+	// 载入顺序：优先读 bots.json，否则从 legacy 单 bot env (WECOM_BOT_ID/SECRET/APP_KEY) 合成一条。
+	// appKey 必须在 bots 间唯一——chatId 反查路由依赖它区分 bot。
+	Bots []BotConfig
+}
+
+// BotConfig 单个企微 bot 的凭证 + 标识。AppKey 是 bridge 内部路由键，chatId
+// 反查表靠它把 outbound 消息发回对应 bot。AppKey 不会透给企微服务端。
+type BotConfig struct {
+	ID     string `json:"id"`
+	Secret string `json:"secret"`
+	AppKey string `json:"appKey"`
 }
 
 // Load reads .env (if present) then parses env vars into Config. Missing
@@ -69,7 +84,75 @@ func Load() (Config, error) {
 	if err := rejectDeprecated(); err != nil {
 		return Config{}, err
 	}
+
+	bots, err := loadBots(cfg)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Bots = bots
+
 	return cfg, nil
+}
+
+// loadBots 解析 bots.json，失败退回 legacy 单 bot env。
+// 路径优先级：BRIDGE_BOTS_FILE > $StateDir/bots.json。
+// WecomEnabled=false 时返回 nil（Phase 2 或不跑 wecom 的单元测试场景）。
+func loadBots(cfg Config) ([]BotConfig, error) {
+	if !cfg.WecomEnabled {
+		return nil, nil
+	}
+
+	path := strings.TrimSpace(os.Getenv("BRIDGE_BOTS_FILE"))
+	if path == "" {
+		path = filepath.Join(cfg.StateDir, "bots.json")
+	}
+
+	if data, err := os.ReadFile(path); err == nil {
+		var bots []BotConfig
+		if err := json.Unmarshal(data, &bots); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		return validateBots(bots, path)
+	}
+
+	// legacy 单 bot env：WECOM_BOT_ID + WECOM_SECRET 合成一条
+	if cfg.WecomBotID == "" || cfg.WecomSecret == "" {
+		return nil, fmt.Errorf("WECOM_ENABLED=true but no bot credentials: set bots.json or WECOM_BOT_ID+WECOM_SECRET")
+	}
+	appKey := cfg.WecomAppKey
+	if appKey == "" {
+		appKey = "default"
+	}
+	return []BotConfig{{ID: cfg.WecomBotID, Secret: cfg.WecomSecret, AppKey: appKey}}, nil
+}
+
+func validateBots(bots []BotConfig, path string) ([]BotConfig, error) {
+	if len(bots) == 0 {
+		return nil, fmt.Errorf("%s is empty: need at least one bot", path)
+	}
+	seenKeys := map[string]int{}
+	seenIDs := map[string]int{}
+	for i, b := range bots {
+		b.ID = strings.TrimSpace(b.ID)
+		b.Secret = strings.TrimSpace(b.Secret)
+		b.AppKey = strings.TrimSpace(b.AppKey)
+		if b.ID == "" || b.Secret == "" {
+			return nil, fmt.Errorf("%s[%d]: id and secret required", path, i)
+		}
+		if b.AppKey == "" {
+			b.AppKey = b.ID // 未指定时用 bot id 兜底，保证唯一
+		}
+		if prev, dup := seenKeys[b.AppKey]; dup {
+			return nil, fmt.Errorf("%s: duplicate appKey %q at entries [%d] and [%d]", path, b.AppKey, prev, i)
+		}
+		seenKeys[b.AppKey] = i
+		if prev, dup := seenIDs[b.ID]; dup {
+			return nil, fmt.Errorf("%s: duplicate bot id %q at entries [%d] and [%d]", path, b.ID, prev, i)
+		}
+		seenIDs[b.ID] = i
+		bots[i] = b
+	}
+	return bots, nil
 }
 
 func getOr(key, fallback string) string {

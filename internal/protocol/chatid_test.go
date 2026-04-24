@@ -75,6 +75,29 @@ func TestResolveOrCreateReusesSameChatIDForSameSource(t *testing.T) {
 	}
 }
 
+// 多 bot 路由的核心：ResolveOrCreate 时记录 chatId → appKey，后续可反查。
+func TestResolveOrCreateRegistersOwnerForReverseLookup(t *testing.T) {
+	f := NewFormatter()
+	now := time.Unix(1700000000, 0)
+
+	idA := f.ResolveOrCreate("bot-aaa", "single", "user-1", now)
+	idB := f.ResolveOrCreate("bot-bbb", "single", "user-1", now)
+	if idA == idB {
+		t.Fatalf("different appKeys must produce different chatIds: %s vs %s", idA, idB)
+	}
+
+	if got, ok := f.OwnerAppKey(idA); !ok || got != "bot-aaa" {
+		t.Fatalf("OwnerAppKey(idA) = (%q, %v), want (bot-aaa, true)", got, ok)
+	}
+	if got, ok := f.OwnerAppKey(idB); !ok || got != "bot-bbb" {
+		t.Fatalf("OwnerAppKey(idB) = (%q, %v), want (bot-bbb, true)", got, ok)
+	}
+
+	if _, ok := f.OwnerAppKey("wecom#single#never-seen#xyz"); ok {
+		t.Fatalf("unknown chatId must not resolve")
+	}
+}
+
 func TestFormatMonotonic(t *testing.T) {
 	f := NewFormatter()
 	a := f.Format("single", "abc", time.Unix(1700000000, 0))

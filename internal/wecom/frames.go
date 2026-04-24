@@ -111,13 +111,17 @@ func NewReplyStream(sourceReqID, streamID, content string, finish bool) ReplyStr
 
 // Inbound 来自企业微信的所有帧的解码；通过 Cmd 分发。
 type Inbound struct {
-	Cmd     string   `json:"cmd"`
-	Headers headers  `json:"headers"`
+	Cmd     string      `json:"cmd"`
+	Headers headers     `json:"headers"`
 	Body    InboundBody `json:"body"`
 
 	// ACK 字段（Cmd==aibot_subscribe / ping / aibot_respond_msg 的回包）
 	ErrCode int    `json:"errcode,omitempty"`
 	ErrMsg  string `json:"errmsg,omitempty"`
+
+	// AppKey 由 wecom.Client 在 OnMessage dispatch 前写入，标识消息归属的 bot。
+	// bridge 多 bot 路由靠它做 chatId 和入站消息的 owner 绑定。JSON 不序列化。
+	AppKey string `json:"-"`
 }
 
 type InboundBody struct {

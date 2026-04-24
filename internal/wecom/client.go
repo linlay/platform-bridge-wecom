@@ -37,6 +37,9 @@ type ClientConfig struct {
 	URL    string
 	BotID  string
 	Secret string
+	// AppKey 是 bridge 内部给这个 bot 的路由标签，随每条 Inbound 传出。
+	// 留空时 fallback 为 "default"（兼容 Phase 2 单 bot 场景）。
+	AppKey string
 
 	HeartbeatInterval time.Duration
 	PongTimeout       time.Duration // ACK 超时；默认 5s
@@ -116,6 +119,14 @@ func (c *Client) ackRichCh(cmd string) chan AckRich {
 }
 
 // Run 在调用方 goroutine 里跑，直到 ctx 取消。
+// AppKey 返回 client 绑定的 bot 路由标签；供 bridge 注册时反查用。
+func (c *Client) AppKey() string {
+	if c.cfg.AppKey == "" {
+		return "default"
+	}
+	return c.cfg.AppKey
+}
+
 func (c *Client) Run(ctx context.Context) {
 	backoff := c.cfg.ReconnectMin
 	for {
@@ -226,6 +237,10 @@ func (c *Client) readLoop(ctx context.Context, conn *gws.Conn) error {
 		}
 		switch env.Cmd {
 		case CmdCallback:
+			env.AppKey = c.cfg.AppKey
+			if env.AppKey == "" {
+				env.AppKey = "default"
+			}
 			if c.cfg.OnMessage != nil {
 				go c.cfg.OnMessage(env) // 避免回调阻塞读循环
 			}

@@ -75,10 +75,9 @@ func main() {
 		"=========================================\n",
 		cfg.HTTPAddr, cfg.AgentKey, cfg.Channel, tk)
 
-	// bridge：注入 Platform sender（通过 ws 指针间接）；Wecom 稍后注入
+	// bridge：注入 Platform sender（通过 ws 指针间接）；Wecom 各 bot 在下面按 cfg.Bots 逐个注入
 	psender := &platformSenderAdapter{}
 	br := wecom.NewBridge(wecom.BridgeConfig{
-		AppKey:         cfg.WecomAppKey,
 		Channel:        cfg.Channel,
 		AgentKey:       cfg.AgentKey,
 		Platform:       psender,
@@ -109,27 +108,35 @@ func main() {
 	})
 	psender.ws = ws
 
-	var wcli *wecom.Client
+	// 每个 bot 起一条 wecom.Client（独立 ws 订阅），都注册到 bridge 的 senders/streams map。
+	// bridge 按 chatId → appKey 路由出站消息到对应 client。
+	var clients []*wecom.Client
 	if cfg.WecomEnabled {
-		if cfg.WecomBotID == "" || cfg.WecomSecret == "" {
-			log.Fatalf("WECOM_ENABLED=true but WECOM_BOT_ID / WECOM_SECRET is empty")
+		if len(cfg.Bots) == 0 {
+			log.Fatalf("WECOM_ENABLED=true but no bots configured (set bots.json or WECOM_BOT_ID+WECOM_SECRET)")
 		}
-		wcli = wecom.NewClient(wecom.ClientConfig{
-			URL:               cfg.WecomWSURL,
-			BotID:             cfg.WecomBotID,
-			Secret:            cfg.WecomSecret,
-			HeartbeatInterval: time.Duration(cfg.WecomHeartbeatSec) * time.Second,
-			ReconnectMin:      time.Second,
-			ReconnectMax:      30 * time.Second,
-			OnReady:           func() { diag.Info("bridge.wecom.ready") },
-			OnMessage: func(in wecom.Inbound) {
-				br.HandleWecomMessage(in)
-			},
-		})
-		br.SetWecom(wcli)
-		// StreamSender 依赖 wcli 的 SendMarkdown（aibot_respond_msg stream），
-		// 必须在 wcli 就绪后构造；对齐 Java WecomMessageSender 的流式路径。
-		br.SetStream(wecom.NewStreamSender(wcli))
+		for _, bot := range cfg.Bots {
+			appKey := bot.AppKey
+			cli := wecom.NewClient(wecom.ClientConfig{
+				URL:               cfg.WecomWSURL,
+				BotID:             bot.ID,
+				Secret:            bot.Secret,
+				AppKey:            appKey,
+				HeartbeatInterval: time.Duration(cfg.WecomHeartbeatSec) * time.Second,
+				ReconnectMin:      time.Second,
+				ReconnectMax:      30 * time.Second,
+				OnReady: func(k string) func() {
+					return func() { diag.Info("bridge.wecom.ready", "appKey", k) }
+				}(appKey),
+				OnMessage: func(in wecom.Inbound) {
+					br.HandleWecomMessage(in)
+				},
+			})
+			br.SetWecomFor(appKey, cli)
+			br.SetStreamFor(appKey, wecom.NewStreamSender(cli))
+			clients = append(clients, cli)
+			diag.Info("bridge.wecom.bot.registered", "appKey", appKey, "botId", bot.ID)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -149,8 +156,8 @@ func main() {
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if wcli != nil {
-		go wcli.Run(shutdownCtx)
+	for _, cli := range clients {
+		go cli.Run(shutdownCtx)
 	}
 
 	go func() {
@@ -191,11 +198,15 @@ func handleGatewayInfo(cfg config.Config, token string) http.HandlerFunc {
 			channel = channel[:idx]
 		}
 
-		id := strings.TrimSpace(cfg.WecomBotID)
-		if id != "" {
-			id = channel + "-" + id
-		} else {
-			id = "bridge-" + channel
+		// id 作为 platform 侧 gateway 唯一键。优先显式 BRIDGE_GATEWAY_ID；否则
+		// 单 bot → "{channel}-{botId}"；多 bot → "bridge-{channel}" + 第一个 bot id 当稳定锚点。
+		id := strings.TrimSpace(os.Getenv("BRIDGE_GATEWAY_ID"))
+		if id == "" {
+			if len(cfg.Bots) > 0 {
+				id = channel + "-" + cfg.Bots[0].ID
+			} else {
+				id = "bridge-" + channel
+			}
 		}
 
 		host := r.Host

@@ -39,7 +39,6 @@ type PlatformSender interface {
 }
 
 type BridgeConfig struct {
-	AppKey   string
 	Channel  string // e.g. "wecom:personal"
 	AgentKey string
 
@@ -48,11 +47,12 @@ type BridgeConfig struct {
 	UserID         string // 存盘目录 + download URL 的 path 第一段
 	DownloadTicket string // 附在 URL 查询串 ?ticket=
 
-	Wecom    WecomSender
 	Platform PlatformSender
 	Registry *Registry
 	Dedup    *Cache
-	Stream   *StreamSender
+	// Streams 每个 bot 一个 StreamSender；SetStreamFor 注入。
+	// 单 bot 场景下只有一条 "default" 条目。
+	Streams map[string]*StreamSender
 }
 
 // MediaStore 是 server.FileStore 的最小契约（便于注入 fake）。
@@ -74,24 +74,88 @@ type Bridge struct {
 	// 让 agent 在 system prompt 的 Session.references 里直接看到文件名。
 	pendingRefs   map[string][]map[string]any
 	pendingRefsMu sync.Mutex
+
+	// senders: appKey → 对应 bot 的 WecomSender。SetWecomFor / SetWecom 填充。
+	// 出站路径按 chatId 反查 appKey，再用这张表找回对应 bot 的 client。
+	sendersMu sync.RWMutex
+	senders   map[string]WecomSender
 }
 
 func NewBridge(cfg BridgeConfig) *Bridge {
+	if cfg.Streams == nil {
+		cfg.Streams = map[string]*StreamSender{}
+	}
 	return &Bridge{
 		cfg:         cfg,
 		formatter:   protocol.NewFormatter(),
 		pushDedup:   map[string]string{},
 		pendingRefs: map[string][]map[string]any{},
+		senders:     map[string]WecomSender{},
 	}
 }
 
-// SetWecom 在 bridge 创建之后、wecom.Client 初始化完成时注入。
-// 两者相互引用（bridge 调 wecom 发 markdown，wecom 调 bridge OnMessage），
-// 必须分两步注入避免循环构造。
-func (b *Bridge) SetWecom(w WecomSender) { b.cfg.Wecom = w }
+// SetWecom 向后兼容：单 bot 场景下注入唯一 sender，绑定到 "default" appKey。
+// wecom.Client 的 AppKey 留空时也 fallback 为 "default"，整条链路自洽。
+func (b *Bridge) SetWecom(w WecomSender) { b.SetWecomFor("default", w) }
 
-// SetStream 注入 StreamSender；main 在 wecom.Client 构造完成后再构造 StreamSender。
-func (b *Bridge) SetStream(s *StreamSender) { b.cfg.Stream = s }
+// SetWecomFor 多 bot 场景下按 appKey 注入对应 sender。appKey 为空回退到 "default"。
+func (b *Bridge) SetWecomFor(appKey string, w WecomSender) {
+	if appKey == "" {
+		appKey = "default"
+	}
+	b.sendersMu.Lock()
+	b.senders[appKey] = w
+	b.sendersMu.Unlock()
+}
+
+// senderFor 按 appKey 查对应 bot 的 sender。找不到时若仅有一条条目兜底返回它（单 bot 兼容）。
+func (b *Bridge) senderFor(appKey string) (WecomSender, bool) {
+	b.sendersMu.RLock()
+	defer b.sendersMu.RUnlock()
+	if appKey != "" {
+		if s, ok := b.senders[appKey]; ok {
+			return s, true
+		}
+	}
+	if len(b.senders) == 1 {
+		for _, s := range b.senders {
+			return s, true
+		}
+	}
+	if s, ok := b.senders["default"]; ok {
+		return s, true
+	}
+	return nil, false
+}
+
+// SetStream 向后兼容：单 bot 绑 "default"。
+func (b *Bridge) SetStream(s *StreamSender) { b.SetStreamFor("default", s) }
+
+// SetStreamFor 多 bot 按 appKey 注入各自的 StreamSender。
+func (b *Bridge) SetStreamFor(appKey string, s *StreamSender) {
+	if appKey == "" {
+		appKey = "default"
+	}
+	if b.cfg.Streams == nil {
+		b.cfg.Streams = map[string]*StreamSender{}
+	}
+	b.cfg.Streams[appKey] = s
+}
+
+// streamFor 按 appKey 查对应 StreamSender，找不到走单条兜底（兼容单 bot 部署）。
+func (b *Bridge) streamFor(appKey string) *StreamSender {
+	if appKey != "" {
+		if s, ok := b.cfg.Streams[appKey]; ok {
+			return s
+		}
+	}
+	if len(b.cfg.Streams) == 1 {
+		for _, s := range b.cfg.Streams {
+			return s
+		}
+	}
+	return b.cfg.Streams["default"]
+}
 
 // addPendingRef 在 handleMedia 把文件推给 platform 之后调用，记下一个待带入下次
 // forwardText 的 reference。
@@ -121,7 +185,11 @@ func (b *Bridge) HandleWecomMessage(in Inbound) {
 	if in.Cmd != CmdCallback {
 		return
 	}
-	if b.cfg.Dedup != nil && b.cfg.Dedup.Seen(b.cfg.AppKey, in.Headers.ReqID) {
+	// Client 正常会在 OnMessage 前置 AppKey，这里兜底（单元测试直接构造 Inbound 可能漏填）。
+	if in.AppKey == "" {
+		in.AppKey = "default"
+	}
+	if b.cfg.Dedup != nil && b.cfg.Dedup.Seen(in.AppKey, in.Headers.ReqID) {
 		diag.Debug("bridge.wecom.dup", "reqId", in.Headers.ReqID)
 		return
 	}
@@ -154,7 +222,9 @@ func (b *Bridge) handleVoice(in Inbound) {
 	}
 	if strings.TrimSpace(text) == "" {
 		diag.Warn("bridge.wecom.voice.no_text")
-		_ = b.cfg.Wecom.SendText(in.Headers.ReqID, "Voice message content is empty. Please try again.")
+		if s, ok := b.senderFor(in.AppKey); ok {
+			_ = s.SendText(in.Headers.ReqID, "Voice message content is empty. Please try again.")
+		}
 		return
 	}
 	b.forwardText(in, text)
@@ -176,10 +246,10 @@ func (b *Bridge) forwardText(in Inbound, content string) {
 	receiveID := scope.SourceID
 	receiveIDType := "chatid"
 
-	chatID := b.formatter.ResolveOrCreate(b.cfg.AppKey, scope.ChatType, scope.SourceID, time.Now())
-	diag.Info("bridge.wecom.forward", "chatId", chatID, "msgtype", in.Body.MsgType, "sourceReqId", in.Headers.ReqID)
+	chatID := b.formatter.ResolveOrCreate(in.AppKey, scope.ChatType, scope.SourceID, time.Now())
+	diag.Info("bridge.wecom.forward", "chatId", chatID, "appKey", in.AppKey, "msgtype", in.Body.MsgType, "sourceReqId", in.Headers.ReqID)
 	b.cfg.Registry.Register(chatID, Target{
-		AppKey:        b.cfg.AppKey,
+		AppKey:        in.AppKey,
 		ReceiveID:     receiveID,
 		ReceiveIDType: receiveIDType,
 		SourceReqID:   in.Headers.ReqID,
@@ -187,8 +257,8 @@ func (b *Bridge) forwardText(in Inbound, content string) {
 
 	reqID := uuid.NewString()
 	// 登记流式 sender：后续从 platform 来的 stream 事件按 requestId（= stream frame.id）归到这个 run。
-	if b.cfg.Stream != nil {
-		b.cfg.Stream.Open(reqID, chatID, in.Headers.ReqID)
+	if stream := b.streamFor(in.AppKey); stream != nil {
+		stream.Open(reqID, chatID, in.Headers.ReqID)
 	}
 	refs := b.takePendingRefs(chatID)
 	if len(refs) == 0 {
@@ -207,7 +277,7 @@ func (b *Bridge) forwardText(in Inbound, content string) {
 		"references": refs,
 		"params": map[string]any{
 			"channel":           b.cfg.Channel,
-			"wecomAppKey":       b.cfg.AppKey,
+			"wecomAppKey":       in.AppKey,
 			"userId":            userID,
 			"sourceReqId":       in.Headers.ReqID,
 			"sourceMsgId":       in.Body.MsgID,
@@ -280,10 +350,10 @@ func (b *Bridge) handleMedia(in Inbound) {
 	receiveID := scope.SourceID
 	receiveIDType := "chatid"
 
-	chatID := b.formatter.ResolveOrCreate(b.cfg.AppKey, scope.ChatType, scope.SourceID, time.Now())
-	diag.Info("bridge.wecom.media", "chatId", chatID, "msgtype", in.Body.MsgType, "sourceReqId", in.Headers.ReqID)
+	chatID := b.formatter.ResolveOrCreate(in.AppKey, scope.ChatType, scope.SourceID, time.Now())
+	diag.Info("bridge.wecom.media", "chatId", chatID, "appKey", in.AppKey, "msgtype", in.Body.MsgType, "sourceReqId", in.Headers.ReqID)
 	b.cfg.Registry.Register(chatID, Target{
-		AppKey:        b.cfg.AppKey,
+		AppKey:        in.AppKey,
 		ReceiveID:     receiveID,
 		ReceiveIDType: receiveIDType,
 		SourceReqID:   in.Headers.ReqID,
@@ -297,8 +367,8 @@ func (b *Bridge) handleMedia(in Inbound) {
 	}
 
 	reqID := "upload_" + uuid.NewString()
-	if b.cfg.Stream != nil {
-		b.cfg.Stream.Open(reqID, chatID, in.Headers.ReqID)
+	if stream := b.streamFor(in.AppKey); stream != nil {
+		stream.Open(reqID, chatID, in.Headers.ReqID)
 	}
 	urlPath := buildDownloadURL(b.cfg.UserID, chatID, fileID, b.cfg.DownloadTicket)
 	payloadJSON := map[string]any{
@@ -337,27 +407,30 @@ func (b *Bridge) handleMedia(in Inbound) {
 }
 
 // SendMediaToWecom 由 httpapi /api/push 回调：把 platform 推过来的文件交给企微。
+// 按 chatId 反查 target.AppKey，再用对应 bot 的 sender 上传 + 发送。
 func (b *Bridge) SendMediaToWecom(chatID, name, mimeType string, data []byte) error {
-	if b.cfg.Wecom == nil {
-		return nil // wecom 未启用，静默
-	}
 	target, ok := b.cfg.Registry.Lookup(chatID)
 	if !ok {
 		diag.Warn("bridge.platform.push.unknown_chat", "chatId", chatID)
 		return nil
 	}
+	sender, ok := b.senderFor(target.AppKey)
+	if !ok {
+		diag.Warn("bridge.platform.push.no_sender", "chatId", chatID, "appKey", target.AppKey)
+		return nil // wecom 未启用或该 bot 未注册，静默
+	}
 	mediaType := "file"
 	if strings.HasPrefix(mimeType, "image/") {
 		mediaType = "image"
 	}
-	mediaID, err := b.cfg.Wecom.UploadMedia(mediaType, name, data)
+	mediaID, err := sender.UploadMedia(mediaType, name, data)
 	if err != nil {
 		return err
 	}
 	if mediaType == "image" {
-		return b.cfg.Wecom.SendImage(target.ReceiveID, target.ReceiveIDType, mediaID)
+		return sender.SendImage(target.ReceiveID, target.ReceiveIDType, mediaID)
 	}
-	return b.cfg.Wecom.SendFile(target.ReceiveID, target.ReceiveIDType, mediaID)
+	return sender.SendFile(target.ReceiveID, target.ReceiveIDType, mediaID)
 }
 
 func buildDownloadURL(userID, chatID, fileID, ticket string) string {
@@ -383,9 +456,12 @@ func (b *Bridge) HandlePlatformFrame(sessionID string, env protocol.Envelope) {
 	}
 }
 
-// handleStreamFrame 解码 platform 的流式事件并喂给 StreamSender。
+// handleStreamFrame 解码 platform 的流式事件并喂给对应 bot 的 StreamSender。
+// 路由：env.ID 是 requestId，StreamSender 内部已登记 chatId → appKey（Open 时写入）。
+// 这里遍历所有 StreamSender 让其尝试处理（Open 过该 reqID 的 sender 会消费，其余 no-op）。
+// 单 bot 场景下只有一条 StreamSender，性能等价于直接调用。
 func (b *Bridge) handleStreamFrame(env protocol.Envelope) {
-	if b.cfg.Stream == nil || env.ID == "" {
+	if len(b.cfg.Streams) == 0 || env.ID == "" {
 		return
 	}
 	if len(env.Event) == 0 {
@@ -399,10 +475,13 @@ func (b *Bridge) handleStreamFrame(env protocol.Envelope) {
 		diag.Warn("bridge.platform.stream.decode", "err", err)
 		return
 	}
-	// 事件负载字段是平铺的，用 map 再读一遍拿到具体字段（delta / contentId 等）。
 	var payload map[string]any
 	_ = json.Unmarshal(env.Event, &payload)
-	b.cfg.Stream.HandleEvent(env.ID, evt.Type, payload)
+	for _, s := range b.cfg.Streams {
+		if s != nil {
+			s.HandleEvent(env.ID, evt.Type, payload)
+		}
+	}
 }
 
 // handleChatUpdated 对齐 Java DownstreamAgentPushWebSocketHandler.java:266：
@@ -421,9 +500,15 @@ func (b *Bridge) handleChatUpdated(env protocol.Envelope) {
 	if data.ChatID == "" || data.LastRunContent == "" {
 		return
 	}
-	if b.cfg.Stream != nil && b.cfg.Stream.HandledChat(data.ChatID) {
+	target, ok := b.cfg.Registry.Lookup(data.ChatID)
+	if !ok {
+		diag.Warn("bridge.platform.chat_updated.unknown_chat", "chatId", data.ChatID)
+		return
+	}
+	// stream 路径已处理就不做兜底（避免重复发）；按 target.AppKey 找对应 bot 的 StreamSender。
+	if stream := b.streamFor(target.AppKey); stream != nil && stream.HandledChat(data.ChatID) {
 		diag.Debug("bridge.platform.chat_updated.stream_handled", "chatId", data.ChatID, "runId", data.LastRunID)
-		b.cfg.Stream.ForgetChat(data.ChatID) // 本轮已处理，清除标记以便下一轮跨 session 推送仍能兜底
+		stream.ForgetChat(data.ChatID)
 		b.pushDedup[data.ChatID] = data.LastRunID
 		return
 	}
@@ -431,12 +516,12 @@ func (b *Bridge) handleChatUpdated(env protocol.Envelope) {
 		diag.Debug("bridge.platform.chat_updated.dup", "chatId", data.ChatID, "runId", data.LastRunID)
 		return
 	}
-	target, ok := b.cfg.Registry.Lookup(data.ChatID)
+	sender, ok := b.senderFor(target.AppKey)
 	if !ok {
-		diag.Warn("bridge.platform.chat_updated.unknown_chat", "chatId", data.ChatID)
+		diag.Warn("bridge.platform.chat_updated.no_sender", "chatId", data.ChatID, "appKey", target.AppKey)
 		return
 	}
-	if err := b.cfg.Wecom.SendMarkdownPush(target.ReceiveID, target.ReceiveIDType, data.LastRunContent); err != nil {
+	if err := sender.SendMarkdownPush(target.ReceiveID, target.ReceiveIDType, data.LastRunContent); err != nil {
 		diag.Warn("bridge.platform.chat_updated.wecom_send_fail", "err", err)
 		return
 	}

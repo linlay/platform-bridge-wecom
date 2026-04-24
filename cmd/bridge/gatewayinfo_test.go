@@ -12,9 +12,9 @@ import (
 
 func TestHandleGatewayInfoResponseShape(t *testing.T) {
 	cfg := config.Config{
-		AgentKey:    "zenmi",
-		Channel:     "wecom:xiaozhai",
-		WecomBotID:  "botAAA",
+		AgentKey: "zenmi",
+		Channel:  "wecom:xiaozhai",
+		Bots:     []config.BotConfig{{ID: "botAAA", Secret: "s", AppKey: "xiaozhai"}},
 	}
 	h := handleGatewayInfo(cfg, "jwt-token-xyz")
 

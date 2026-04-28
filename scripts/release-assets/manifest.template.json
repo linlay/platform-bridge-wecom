@@ -1,0 +1,50 @@
+{
+  "kind": "plugin",
+  "id": "platform-bridge-wecom",
+  "name": "企业微信桥接",
+  "version": "__VERSION__",
+  "description": "企业微信 bridge，对接 platform 反向 WS。",
+  "platform": {
+    "os": "__TARGET_OS__",
+    "arch": "__TARGET_ARCH__"
+  },
+  "frontend": {
+    "mode": "none"
+  },
+  "backend": {
+    "entry": "__BACKEND_ENTRY__"
+  },
+  "scripts": {
+    "start": "__START_SCRIPT__",
+    "stop": "__STOP_SCRIPT__"
+  },
+  "configFiles": [
+    {
+      "key": "env",
+      "label": ".env",
+      "relativePath": ".env",
+      "templateRelativePath": ".env.example",
+      "required": true
+    }
+  ],
+  "runtime": {
+    "pidRelativePath": "run/bridge.pid",
+    "logRelativePath": "run/bridge.log",
+    "errorLogRelativePath": "run/bridge.stderr.log"
+  },
+  "web": {
+    "routePath": "",
+    "portEnvKey": "BRIDGE_HTTP_ADDR",
+    "defaultPort": 11970
+  },
+  "desktop": {
+    "displayOrder": 10,
+    "autoStart": false,
+    "bridge": {
+      "category": "bridge",
+      "channelId": "wecom",
+      "channelName": "企业微信",
+      "gatewayInfoEndpoint": "/gateway/info"
+    }
+  }
+}

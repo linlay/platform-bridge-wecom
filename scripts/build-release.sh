@@ -38,6 +38,8 @@ LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.build
 
 echo "==> building ${BINARY_NAME} ${VERSION} (${COMMIT})"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 for target in "${TARGETS[@]}"; do
   GOOS="${target%/*}"
   GOARCH="${target#*/}"
@@ -56,6 +58,19 @@ for target in "${TARGETS[@]}"; do
 
   cp README.md SPEC.md VERSION "${pkg_dir}/" 2>/dev/null || true
   if [ -f .env.example ]; then cp .env.example "${pkg_dir}/"; fi
+
+  # Write manifest.json from template
+  sed -e "s/__VERSION__/${VERSION}/g" \
+      -e "s/__TARGET_OS__/${GOOS}/g" \
+      -e "s/__TARGET_ARCH__/${GOARCH}/g" \
+      -e "s/__BACKEND_ENTRY__/${BINARY_NAME}${suffix}/g" \
+      -e "s/__START_SCRIPT__/start.sh/g" \
+      -e "s/__STOP_SCRIPT__/stop.sh/g" \
+      "${SCRIPT_DIR}/release-assets/manifest.template.json" > "${pkg_dir}/manifest.json"
+
+  # Copy start/stop scripts
+  cp "${SCRIPT_DIR}/release-assets/start.sh" "${pkg_dir}/"
+  cp "${SCRIPT_DIR}/release-assets/stop.sh" "${pkg_dir}/"
 
   pushd "${OUT_ROOT}" > /dev/null
   if [ "${GOOS}" = "windows" ]; then

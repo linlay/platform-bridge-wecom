@@ -63,12 +63,30 @@ foreach ($target in $Targets) {
         if (Test-Path $f) { Copy-Item $f $pkgDir }
     }
 
+    # Write manifest.json from template
+    $manifestTmpl = Join-Path $PSScriptRoot "release-assets\manifest.template.json"
+    $manifestDest = Join-Path $pkgDir "manifest.json"
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $manifest = [System.IO.File]::ReadAllText($manifestTmpl, $utf8NoBom)
+    $manifest = $manifest.Replace('__VERSION__', $Version)
+    $manifest = $manifest.Replace('__TARGET_OS__', $goos)
+    $manifest = $manifest.Replace('__TARGET_ARCH__', $goarch)
+    $manifest = $manifest.Replace('__BACKEND_ENTRY__', "$BinaryName$suffix")
+    $manifest = $manifest.Replace('__START_SCRIPT__', "start.sh")
+    $manifest = $manifest.Replace('__STOP_SCRIPT__', "stop.sh")
+    [System.IO.File]::WriteAllText($manifestDest, $manifest, $utf8NoBom)
+
+    # Copy start/stop scripts
+    Copy-Item (Join-Path $PSScriptRoot "release-assets\start.sh") $pkgDir
+    Copy-Item (Join-Path $PSScriptRoot "release-assets\stop.sh") $pkgDir
+
     Push-Location $OutRoot
     try {
         if ($goos -eq "windows") {
             $zipPath = "$pkgName.zip"
             if (Test-Path $zipPath) { Remove-Item $zipPath }
-            Compress-Archive -Path $pkgName -DestinationPath $zipPath
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($pkgName, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
             $ChecksumLines += "$((Get-Sha256 $zipPath))  $zipPath"
         } else {
             $tarPath = "$pkgName.tar.gz"
